@@ -7,8 +7,7 @@ const { init: initDB, Counter } = require("./db");
 const TEST_IMAGE2_API_KEY = "这里填我的测试key";
 const IMAGE2_API_KEY = process.env.IMAGE2_API_KEY || TEST_IMAGE2_API_KEY;
 const IMAGE2_BASE_URL = "https://3698520.xyz";
-const IMAGE2_MODEL = process.env.IMAGE2_MODEL || "gpt-image-1";
-const FALLBACK_IMAGE_URL = "https://picsum.photos/1024/1024";
+const IMAGE2_MODEL = process.env.IMAGE2_MODEL || "gpt-image-2";
 
 const logger = morgan("tiny");
 
@@ -47,8 +46,7 @@ app.get("/api/count", async (req, res) => {
 
 async function getTempImageUrls(referenceFileIDs) {
   // TODO: Convert WeChat cloud:// fileIDs to temporary public URLs.
-  // The first real API version runs text-to-image only, so these URLs are
-  // intentionally not sent to image2 yet.
+  // This text-to-image version keeps reference images out of the image2 request.
   return referenceFileIDs;
 }
 
@@ -82,21 +80,27 @@ function buildImagePrompt({ prompt, ratio, style }) {
   ].join("\n");
 }
 
-function extractImageUrl(data) {
+function extractImageResult(data) {
   const firstImage = data && Array.isArray(data.data) ? data.data[0] : null;
   if (!firstImage) {
-    return "";
+    return null;
   }
 
   if (firstImage.url) {
-    return firstImage.url;
+    return {
+      imageUrl: firstImage.url,
+      responseType: "url",
+    };
   }
 
   if (firstImage.b64_json) {
-    return `data:image/png;base64,${firstImage.b64_json}`;
+    return {
+      imageUrl: `data:image/png;base64,${firstImage.b64_json}`,
+      responseType: "b64_json",
+    };
   }
 
-  return "";
+  return null;
 }
 
 async function callImage2Api({ prompt, ratio, style, imageUrls }) {
@@ -110,7 +114,6 @@ async function callImage2Api({ prompt, ratio, style, imageUrls }) {
     prompt: buildImagePrompt({ prompt, ratio, style }),
     n: 1,
     size: getImageSizeByRatio(ratio),
-    response_format: "url",
   };
 
   // imageUrls is reserved for the next image-to-image version. Do not include
@@ -134,32 +137,44 @@ async function callImage2Api({ prompt, ratio, style, imageUrls }) {
   });
 
   const responseText = await response.text();
+
+  if (!response.ok) {
+    console.error("image2 API request failed", {
+      status: response.status,
+      responseText,
+      endpoint,
+      model: IMAGE2_MODEL,
+    });
+    throw new Error("image2 API request failed");
+  }
+
   let responseData = {};
   if (responseText) {
     try {
       responseData = JSON.parse(responseText);
     } catch (error) {
-      console.error("image2 返回非 JSON 内容", responseText);
-      throw new Error("image2 返回格式错误");
+      console.error("image2 API returned non-JSON response", {
+        status: response.status,
+        responseText,
+        endpoint,
+        model: IMAGE2_MODEL,
+      });
+      throw new Error("image2 API returned non-JSON response");
     }
   }
 
-  if (!response.ok) {
-    console.error("image2 API 请求失败", {
+  const imageResult = extractImageResult(responseData);
+  if (!imageResult) {
+    console.error("image2 API response did not include image data", {
       status: response.status,
-      statusText: response.statusText,
-      body: responseData,
+      responseText,
+      endpoint,
+      model: IMAGE2_MODEL,
     });
-    throw new Error("image2 API 请求失败");
+    throw new Error("image2 API response did not include image data");
   }
 
-  const imageUrl = extractImageUrl(responseData);
-  if (!imageUrl) {
-    console.error("image2 API 响应中未找到图片 URL", responseData);
-    throw new Error("image2 API 响应中未找到图片 URL");
-  }
-
-  return imageUrl;
+  return imageResult;
 }
 
 app.post("/api/generate-image", async (req, res) => {
@@ -197,45 +212,28 @@ app.post("/api/generate-image", async (req, res) => {
     }
 
     const imageUrls = await getTempImageUrls(referenceFileIDs);
+    const { imageUrl, responseType } = await callImage2Api({
+      prompt: normalizedPrompt,
+      ratio,
+      style,
+      imageUrls,
+    });
 
-    try {
-      const imageUrl = await callImage2Api({
-        prompt: normalizedPrompt,
-        ratio,
-        style,
-        imageUrls,
-      });
-
-      return res.send({
-        success: true,
-        message: "生成成功",
-        imageUrl,
-        debug: {
-          prompt: normalizedPrompt,
-          ratio,
-          style,
-          referenceFileIDs,
-        },
-      });
-    } catch (error) {
-      console.error("真实 image2 接口调用失败", error);
-      return res.send({
-        success: true,
-        message: "真实接口失败，返回测试图",
-        imageUrl: FALLBACK_IMAGE_URL,
-        debug: {
-          prompt: normalizedPrompt,
-          ratio,
-          style,
-          referenceFileIDs,
-        },
-      });
-    }
+    return res.send({
+      success: true,
+      message: "image2 生成成功",
+      imageUrl,
+      debug: {
+        provider: "image2",
+        model: IMAGE2_MODEL,
+        responseType,
+      },
+    });
   } catch (error) {
     console.error("生成图片失败", error);
-    res.status(500).send({
+    return res.status(502).send({
       success: false,
-      message: "生成图片失败，请稍后重试",
+      message: "image2 API 调用失败，请查看云托管运行日志",
     });
   }
 });
