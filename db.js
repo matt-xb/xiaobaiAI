@@ -1,32 +1,60 @@
 const { Sequelize, DataTypes } = require("sequelize");
 
-// 从环境变量中读取数据库配置
 const { MYSQL_USERNAME, MYSQL_PASSWORD, MYSQL_ADDRESS = "" } = process.env;
 
-const [host, port] = MYSQL_ADDRESS.split(":");
+let memoryCount = 0;
 
-const sequelize = new Sequelize("nodejs_demo", MYSQL_USERNAME, MYSQL_PASSWORD, {
-  host,
-  port,
-  dialect: "mysql" /* one of 'mysql' | 'mariadb' | 'postgres' | 'mssql' */,
-});
-
-// 定义数据模型
-const Counter = sequelize.define("Counter", {
-  count: {
-    type: DataTypes.INTEGER,
-    allowNull: false,
-    defaultValue: 1,
+const MemoryCounter = {
+  async create() {
+    memoryCount += 1;
   },
-});
 
-// 数据库初始化方法
-async function init() {
-  await Counter.sync({ alter: true });
+  async destroy(options = {}) {
+    if (options.truncate) {
+      memoryCount = 0;
+    }
+  },
+
+  async count() {
+    return memoryCount;
+  },
+};
+
+function createMysqlCounter() {
+  const [host, port] = MYSQL_ADDRESS.split(":");
+  const sequelize = new Sequelize("nodejs_demo", MYSQL_USERNAME, MYSQL_PASSWORD, {
+    host,
+    port,
+    dialect: "mysql",
+  });
+
+  const Counter = sequelize.define("Counter", {
+    count: {
+      type: DataTypes.INTEGER,
+      allowNull: false,
+      defaultValue: 1,
+    },
+  });
+
+  return {
+    Counter,
+    async init() {
+      await Counter.sync({ alter: true });
+    },
+  };
 }
 
-// 导出初始化方法和模型
+const hasMysqlConfig = MYSQL_USERNAME && MYSQL_PASSWORD && MYSQL_ADDRESS;
+const database = hasMysqlConfig
+  ? createMysqlCounter()
+  : {
+      Counter: MemoryCounter,
+      async init() {
+        console.log("未检测到 MySQL 环境变量，/api/count 使用内存计数");
+      },
+    };
+
 module.exports = {
-  init,
-  Counter,
+  init: database.init,
+  Counter: database.Counter,
 };
