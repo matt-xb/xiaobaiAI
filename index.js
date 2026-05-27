@@ -1,4 +1,5 @@
 const path = require("path");
+const crypto = require("crypto");
 const express = require("express");
 const cors = require("cors");
 const morgan = require("morgan");
@@ -6,8 +7,9 @@ const { init: initDB, Counter } = require("./db");
 
 const TEST_IMAGE2_API_KEY = "这里填我的测试key";
 const IMAGE2_API_KEY = process.env.IMAGE2_API_KEY || TEST_IMAGE2_API_KEY;
-const IMAGE2_BASE_URL = "https://3698520.xyz";
+const IMAGE2_BASE_URL = process.env.IMAGE2_BASE_URL || "https://3698520.xyz";
 const IMAGE2_MODEL = process.env.IMAGE2_MODEL || "gpt-image-2";
+const imageTasks = new Map();
 
 const logger = morgan("tiny");
 
@@ -177,45 +179,177 @@ async function callImage2Api({ prompt, ratio, style, imageUrls }) {
   return imageResult;
 }
 
+function validateImageRequest(body) {
+  const {
+    prompt,
+    ratio: rawRatio = "1:1",
+    style: rawStyle = "真实摄影",
+    referenceFileIDs,
+  } = body || {};
+
+  const normalizedPrompt = typeof prompt === "string" ? prompt.trim() : "";
+  const ratio = normalizeRatio(rawRatio);
+  const style = normalizeStyle(rawStyle);
+
+  if (!normalizedPrompt) {
+    return {
+      valid: false,
+      statusCode: 400,
+      message: "prompt 不能为空",
+    };
+  }
+
+  if (!Array.isArray(referenceFileIDs)) {
+    return {
+      valid: false,
+      statusCode: 400,
+      message: "referenceFileIDs 必须是数组",
+    };
+  }
+
+  if (referenceFileIDs.length < 1) {
+    return {
+      valid: false,
+      statusCode: 400,
+      message: "referenceFileIDs 至少需要 1 张图片",
+    };
+  }
+
+  return {
+    valid: true,
+    prompt: normalizedPrompt,
+    ratio,
+    style,
+    referenceFileIDs,
+  };
+}
+
+async function runImageTask(taskId) {
+  const task = imageTasks.get(taskId);
+  if (!task) {
+    return;
+  }
+
+  try {
+    const imageUrls = await getTempImageUrls(task.referenceFileIDs);
+    const { imageUrl, responseType } = await callImage2Api({
+      prompt: task.prompt,
+      ratio: task.ratio,
+      style: task.style,
+      imageUrls,
+    });
+
+    imageTasks.set(taskId, {
+      ...task,
+      status: "completed",
+      message: "生成完成",
+      imageUrl,
+      responseType,
+      updatedAt: new Date().toISOString(),
+    });
+  } catch (error) {
+    console.error("异步 image2 任务失败", {
+      taskId,
+      error,
+    });
+
+    imageTasks.set(taskId, {
+      ...task,
+      status: "failed",
+      message: "生成失败",
+      updatedAt: new Date().toISOString(),
+    });
+  }
+}
+
+app.post("/api/create-image-task", async (req, res) => {
+  const validation = validateImageRequest(req.body);
+  if (!validation.valid) {
+    return res.status(validation.statusCode).send({
+      success: false,
+      message: validation.message,
+    });
+  }
+
+  const taskId = crypto.randomUUID();
+  imageTasks.set(taskId, {
+    taskId,
+    status: "processing",
+    message: "图片生成中",
+    prompt: validation.prompt,
+    ratio: validation.ratio,
+    style: validation.style,
+    referenceFileIDs: validation.referenceFileIDs,
+    createdAt: new Date().toISOString(),
+    updatedAt: new Date().toISOString(),
+  });
+
+  setImmediate(() => {
+    runImageTask(taskId);
+  });
+
+  return res.send({
+    success: true,
+    taskId,
+    message: "任务已创建，正在生成",
+  });
+});
+
+app.get("/api/image-task-status", async (req, res) => {
+  const { taskId } = req.query;
+  if (!taskId || typeof taskId !== "string") {
+    return res.status(400).send({
+      success: false,
+      message: "taskId 不能为空",
+    });
+  }
+
+  const task = imageTasks.get(taskId);
+  if (!task) {
+    return res.status(404).send({
+      success: false,
+      message: "任务不存在",
+    });
+  }
+
+  if (task.status === "processing") {
+    return res.send({
+      success: true,
+      status: "processing",
+      message: "图片生成中",
+    });
+  }
+
+  if (task.status === "completed") {
+    return res.send({
+      success: true,
+      status: "completed",
+      imageUrl: task.imageUrl,
+    });
+  }
+
+  return res.send({
+    success: false,
+    status: "failed",
+    message: "生成失败",
+  });
+});
+
 app.post("/api/generate-image", async (req, res) => {
   try {
-    const {
-      prompt,
-      ratio: rawRatio = "1:1",
-      style: rawStyle = "真实摄影",
-      referenceFileIDs,
-    } = req.body || {};
-
-    const normalizedPrompt = typeof prompt === "string" ? prompt.trim() : "";
-    const ratio = normalizeRatio(rawRatio);
-    const style = normalizeStyle(rawStyle);
-
-    if (!normalizedPrompt) {
-      return res.status(400).send({
+    const validation = validateImageRequest(req.body);
+    if (!validation.valid) {
+      return res.status(validation.statusCode).send({
         success: false,
-        message: "prompt 不能为空",
+        message: validation.message,
       });
     }
 
-    if (!Array.isArray(referenceFileIDs)) {
-      return res.status(400).send({
-        success: false,
-        message: "referenceFileIDs 必须是数组",
-      });
-    }
-
-    if (referenceFileIDs.length < 1) {
-      return res.status(400).send({
-        success: false,
-        message: "referenceFileIDs 至少需要 1 张图片",
-      });
-    }
-
-    const imageUrls = await getTempImageUrls(referenceFileIDs);
+    const imageUrls = await getTempImageUrls(validation.referenceFileIDs);
     const { imageUrl, responseType } = await callImage2Api({
-      prompt: normalizedPrompt,
-      ratio,
-      style,
+      prompt: validation.prompt,
+      ratio: validation.ratio,
+      style: validation.style,
       imageUrls,
     });
 
