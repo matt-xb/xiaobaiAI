@@ -46,12 +46,6 @@ app.get("/api/count", async (req, res) => {
   });
 });
 
-async function getTempImageUrls(referenceFileIDs) {
-  // TODO: Convert WeChat cloud:// fileIDs to temporary public URLs.
-  // This text-to-image version keeps reference images out of the image2 request.
-  return referenceFileIDs;
-}
-
 function normalizeRatio(ratio) {
   return typeof ratio === "string" && ratio.trim() ? ratio.trim() : "1:1";
 }
@@ -79,6 +73,7 @@ function buildImagePrompt({ prompt, ratio, style }) {
     prompt,
     `风格：${style}`,
     `画面比例：${ratio}`,
+    "请严格参考用户上传的图片主体、结构和外观，在此基础上进行改图生成。",
   ].join("\n");
 }
 
@@ -105,49 +100,66 @@ function extractImageResult(data) {
   return null;
 }
 
-async function callImage2Api({ prompt, ratio, style, imageUrls }) {
-  if (!IMAGE2_API_KEY || IMAGE2_API_KEY === TEST_IMAGE2_API_KEY) {
-    console.warn("IMAGE2_API_KEY 未配置，当前使用代码里的测试 key");
+function getFileNameFromUrl(imageUrl, index) {
+  try {
+    const pathname = new URL(imageUrl).pathname;
+    const name = pathname.split("/").filter(Boolean).pop();
+    if (name && /\.[a-zA-Z0-9]+$/.test(name)) {
+      return name;
+    }
+  } catch (error) {
+    // Keep the fallback filename.
+  }
+  return `reference-${index + 1}.png`;
+}
+
+async function fetchReferenceImages(referenceImageUrls) {
+  const files = [];
+
+  for (let index = 0; index < referenceImageUrls.length; index += 1) {
+    const imageUrl = referenceImageUrls[index];
+    const response = await fetch(imageUrl);
+    const responseTextForError = response.ok ? "" : await response.text();
+
+    if (!response.ok) {
+      console.error("参考图下载失败", {
+        status: response.status,
+        responseText: responseTextForError,
+        imageUrl,
+      });
+      throw new Error("参考图下载失败");
+    }
+
+    const contentType = response.headers.get("content-type") || "image/png";
+    const arrayBuffer = await response.arrayBuffer();
+    files.push({
+      blob: new Blob([arrayBuffer], { type: contentType }),
+      fileName: getFileNameFromUrl(imageUrl, index),
+    });
   }
 
-  const endpoint = `${IMAGE2_BASE_URL.replace(/\/$/, "")}/v1/images/generations`;
-  const requestBody = {
-    model: IMAGE2_MODEL,
-    prompt: buildImagePrompt({ prompt, ratio, style }),
-    n: 1,
-    size: getImageSizeByRatio(ratio),
-  };
+  return files;
+}
 
-  // imageUrls is reserved for the next image-to-image version. Do not include
-  // it in the request before WeChat cloud fileIDs are converted to public URLs.
-  console.log("Calling image2 API", {
-    endpoint,
-    model: IMAGE2_MODEL,
-    size: requestBody.size,
-    ratio,
-    style,
-    referenceImageCount: Array.isArray(imageUrls) ? imageUrls.length : 0,
-  });
-
+async function postImageEditForm({ endpoint, formData, imageCount }) {
   const response = await fetch(endpoint, {
     method: "POST",
     headers: {
       Authorization: `Bearer ${IMAGE2_API_KEY}`,
-      "Content-Type": "application/json",
     },
-    body: JSON.stringify(requestBody),
+    body: formData,
   });
 
   const responseText = await response.text();
-
   if (!response.ok) {
-    console.error("image2 API request failed", {
+    console.error("image2 edits API request failed", {
       status: response.status,
       responseText,
       endpoint,
       model: IMAGE2_MODEL,
+      imageCount,
     });
-    throw new Error("image2 API request failed");
+    throw new Error("image2 edits API request failed");
   }
 
   let responseData = {};
@@ -155,28 +167,84 @@ async function callImage2Api({ prompt, ratio, style, imageUrls }) {
     try {
       responseData = JSON.parse(responseText);
     } catch (error) {
-      console.error("image2 API returned non-JSON response", {
+      console.error("image2 edits API returned non-JSON response", {
         status: response.status,
         responseText,
         endpoint,
         model: IMAGE2_MODEL,
+        imageCount,
       });
-      throw new Error("image2 API returned non-JSON response");
+      throw new Error("image2 edits API returned non-JSON response");
     }
   }
 
   const imageResult = extractImageResult(responseData);
   if (!imageResult) {
-    console.error("image2 API response did not include image data", {
+    console.error("image2 edits API response did not include image data", {
       status: response.status,
       responseText,
       endpoint,
       model: IMAGE2_MODEL,
+      imageCount,
     });
-    throw new Error("image2 API response did not include image data");
+    throw new Error("image2 edits API response did not include image data");
   }
 
   return imageResult;
+}
+
+async function callImage2EditApi({ prompt, ratio, style, referenceImageUrls }) {
+  if (!IMAGE2_API_KEY || IMAGE2_API_KEY === TEST_IMAGE2_API_KEY) {
+    console.warn("IMAGE2_API_KEY 未配置，当前使用代码里的测试 key");
+  }
+
+  const endpoint = `${IMAGE2_BASE_URL.replace(/\/$/, "")}/v1/images/edits`;
+  const size = getImageSizeByRatio(ratio);
+  const finalPrompt = buildImagePrompt({ prompt, ratio, style });
+  const imageFiles = await fetchReferenceImages(referenceImageUrls);
+
+  async function sendWithImages(files) {
+    const formData = new FormData();
+    formData.append("model", IMAGE2_MODEL);
+    formData.append("prompt", finalPrompt);
+    formData.append("size", size);
+
+    files.forEach((file) => {
+      formData.append("image", file.blob, file.fileName);
+    });
+
+    console.log("Calling image2 edits API", {
+      endpoint,
+      model: IMAGE2_MODEL,
+      imageCount: files.length,
+      promptLength: finalPrompt.length,
+      size,
+    });
+
+    return postImageEditForm({
+      endpoint,
+      formData,
+      imageCount: files.length,
+    });
+  }
+
+  if (imageFiles.length <= 1) {
+    return sendWithImages(imageFiles);
+  }
+
+  try {
+    return await sendWithImages(imageFiles);
+  } catch (error) {
+    console.error("多参考图 edits 调用失败，重试首张参考图", {
+      endpoint,
+      model: IMAGE2_MODEL,
+      imageCount: imageFiles.length,
+      promptLength: finalPrompt.length,
+      size,
+      error,
+    });
+    return sendWithImages(imageFiles.slice(0, 1));
+  }
 }
 
 function validateImageRequest(body) {
@@ -185,6 +253,7 @@ function validateImageRequest(body) {
     ratio: rawRatio = "1:1",
     style: rawStyle = "真实摄影",
     referenceFileIDs,
+    referenceImageUrls,
   } = body || {};
 
   const normalizedPrompt = typeof prompt === "string" ? prompt.trim() : "";
@@ -199,19 +268,19 @@ function validateImageRequest(body) {
     };
   }
 
-  if (!Array.isArray(referenceFileIDs)) {
-    return {
-      valid: false,
-      statusCode: 400,
-      message: "referenceFileIDs 必须是数组",
-    };
-  }
-
-  if (referenceFileIDs.length < 1) {
+  if (!Array.isArray(referenceFileIDs) || referenceFileIDs.length < 1) {
     return {
       valid: false,
       statusCode: 400,
       message: "referenceFileIDs 至少需要 1 张图片",
+    };
+  }
+
+  if (!Array.isArray(referenceImageUrls) || referenceImageUrls.length < 1) {
+    return {
+      valid: false,
+      statusCode: 400,
+      message: "referenceImageUrls 至少需要 1 张图片链接",
     };
   }
 
@@ -221,6 +290,7 @@ function validateImageRequest(body) {
     ratio,
     style,
     referenceFileIDs,
+    referenceImageUrls,
   };
 }
 
@@ -231,12 +301,11 @@ async function runImageTask(taskId) {
   }
 
   try {
-    const imageUrls = await getTempImageUrls(task.referenceFileIDs);
-    const { imageUrl, responseType } = await callImage2Api({
+    const { imageUrl, responseType } = await callImage2EditApi({
       prompt: task.prompt,
       ratio: task.ratio,
       style: task.style,
-      imageUrls,
+      referenceImageUrls: task.referenceImageUrls,
     });
 
     imageTasks.set(taskId, {
@@ -248,7 +317,7 @@ async function runImageTask(taskId) {
       updatedAt: new Date().toISOString(),
     });
   } catch (error) {
-    console.error("异步 image2 任务失败", {
+    console.error("异步 image2 edits 任务失败", {
       taskId,
       error,
     });
@@ -280,6 +349,7 @@ app.post("/api/create-image-task", async (req, res) => {
     ratio: validation.ratio,
     style: validation.style,
     referenceFileIDs: validation.referenceFileIDs,
+    referenceImageUrls: validation.referenceImageUrls,
     createdAt: new Date().toISOString(),
     updatedAt: new Date().toISOString(),
   });
@@ -345,12 +415,11 @@ app.post("/api/generate-image", async (req, res) => {
       });
     }
 
-    const imageUrls = await getTempImageUrls(validation.referenceFileIDs);
-    const { imageUrl, responseType } = await callImage2Api({
+    const { imageUrl, responseType } = await callImage2EditApi({
       prompt: validation.prompt,
       ratio: validation.ratio,
       style: validation.style,
-      imageUrls,
+      referenceImageUrls: validation.referenceImageUrls,
     });
 
     return res.send({
@@ -359,6 +428,7 @@ app.post("/api/generate-image", async (req, res) => {
       imageUrl,
       debug: {
         provider: "image2",
+        endpoint: "/v1/images/edits",
         model: IMAGE2_MODEL,
         responseType,
       },
